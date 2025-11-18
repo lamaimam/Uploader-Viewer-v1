@@ -1,0 +1,5 @@
+girder-client
+requests
+python-dotenv
+boto3
+

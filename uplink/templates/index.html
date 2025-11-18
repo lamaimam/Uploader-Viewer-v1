@@ -1,0 +1,370 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Digital Slide Case Uploader</title>
+
+  <link rel="stylesheet" href="https://cdn.webix.com/edge/webix.css">
+  <script src="https://cdn.webix.com/edge/webix.js"></script>
+
+  <style>
+    html,body{
+      height:100%;width:100%;margin:0;padding:0;
+      background:#f5f6f7;font-family:"Inter",system-ui,sans-serif;
+    }
+    .main-container{
+      display:flex;align-items:center;justify-content:center;height:100%;
+    }
+    .uploader-card{
+      width:100%;max-width:880px;background:#fff;border-radius:16px;
+      box-shadow:0 6px 20px rgba(0,0,0,0.08);padding:40px 50px;
+    }
+    h2{margin:0 0 8px;font-size:26px;font-weight:600;color:#0f172a;}
+
+    #dropzone {
+      border:2px dashed #14b8a6;
+      border-radius:12px;
+      background:#f9fafb;
+      text-align:center;
+      color:#475569;
+      padding:50px 30px;
+      cursor:pointer;
+      transition:border-color .2s,background .2s;
+    }
+    #dropzone.webix_dropover {
+      border-color:#10b981 !important;
+      background:#ecfeff !important;
+    }
+
+    #fileList { margin-top:20px; }
+    .file-block {
+      border:1px solid #e5e7eb;border-radius:10px;
+      padding:12px 16px;margin-bottom:10px;background:#fafafa;
+    }
+    .file-header{
+      display:flex;justify-content:space-between;align-items:center;
+      margin-bottom:4px;
+    }
+    .file-name{font-weight:600;color:#0f172a;}
+    .file-size{font-size:13px;color:#6b7280;margin-right:8px;}
+    .status-text{font-size:13px;font-weight:600;margin-left:10px;}
+    .status-ok { color:#16a34a; }
+    .status-fail { color:#dc2626; }
+    .delete-btn{cursor:pointer;color:#dc2626;font-weight:bold;font-size:20px;}
+    .delete-btn:hover{color:#b91c1c;}
+
+    .progress{height:6px;border-radius:3px;overflow:hidden;background:#e5e7eb;margin-top:6px;}
+    .bar{height:100%;width:0;background:#14b8a6;transition:width .2s;}
+
+    .btn {
+      padding:10px 26px;font-size:15px;border:none;border-radius:8px;
+      cursor:pointer;margin-right:10px;
+    }
+    #uploadDSABtn { background:#14b8a6;color:white; }
+    #uploadS3Btn { background:#0ea5e9;color:white; }
+    #uploadS3Btn:disabled { opacity:0.4;cursor:not-allowed; }
+  </style>
+</head>
+
+<body>
+<div class="main-container">
+  <div class="uploader-card">
+    <h2>Digital Slide Case Uploader</h2>
+
+    <div id="dropzone">📁 Drop slides here or click to choose files</div>
+    <div id="fileList"></div>
+
+    <div style="margin-top:20px;">
+      <button class="btn" id="uploadDSABtn">Upload to DSA</button>
+      <button class="btn" id="uploadS3Btn" disabled>Upload Case to S3</button>
+    </div>
+
+    <div id="statusMsg" style="margin-top:10px;font-weight:500;"></div>
+  </div>
+</div>
+
+
+<script>
+// -----------------------------------------------------
+// CONFIG
+// -----------------------------------------------------
+const uploadDSAUrl = "http://127.0.0.1:8000/api/upload_case_files_dsa/";
+const uploadS3Url  = "http://127.0.0.1:8000/api/upload_case_to_s3/";
+let lastCaseName = null;
+
+const realFiles = [];   // { id, file }
+
+
+// -----------------------------------------------------
+// SMALL ERROR BANNER
+// -----------------------------------------------------
+function showError(msg){
+  const s = document.getElementById("statusMsg");
+  s.textContent = "❌ " + msg;
+  s.style.color = "#dc2626";
+}
+
+
+// -----------------------------------------------------
+// LABEL DETECTOR
+// -----------------------------------------------------
+function detectLabel(name){
+  const n = name.toUpperCase();
+  if(n.includes("PDL1")&&(n.includes("(NC)")||n.includes("-NC")||n.includes("_NC"))) return "PDL1 (NC)";
+  if(n.includes("PDL1")) return "PDL1";
+  if(n.includes("H&E")||n.includes("H_E")||n.includes("HE.")) return "H&E";
+  return "Unknown";
+}
+
+
+// -----------------------------------------------------
+// RENDER FILE BLOCK
+// -----------------------------------------------------
+function renderFileBlock(obj){
+  const file = obj.file;
+
+  const block = document.createElement("div");
+  block.className = "file-block";
+  block.id = "file-" + obj.id;
+
+  block.innerHTML = `
+    <div class="file-header">
+      <div class="file-name">${file.name}</div>
+      <div style="display:flex;align-items:center;">
+        <div class="file-size">${(file.size/1024/1024).toFixed(2)} MB</div>
+        <div class="status-text" id="status-${obj.id}"></div>
+        <div class="delete-btn" onclick="removeFile('${obj.id}')">&times;</div>
+      </div>
+    </div>
+    <div class="progress"><div class="bar" id="bar-${obj.id}"></div></div>
+  `;
+
+  document.getElementById("fileList").appendChild(block);
+}
+
+function removeFile(id){
+  const i = realFiles.findIndex(f => f.id === id);
+  if(i !== -1) realFiles.splice(i, 1);
+
+  const el = document.getElementById("file-" + id);
+  if(el) el.remove();
+}
+
+
+// -----------------------------------------------------
+// WEBIX UPLOADER – BLOCK ZERO-BYTE FILES
+// -----------------------------------------------------
+webix.ui({
+  view:"uploader",
+  id:"uploader",
+  link:"fileList",
+  autosend:false,
+  multiple:true,
+  drop:true,
+  apiOnly:true,
+
+  on: {
+    onBeforeFileAdd:function(item){
+      const file = item.file;
+
+      // BLOCK ZERO-BYTE FILES HERE
+      if (!file || file.size === 0) {
+    webix.message({ type:"error", text: `Cannot add ${file ? file.name : "file"} (0 bytes)` });
+    return false;
+}
+
+
+      const id = webix.uid().toString();
+      realFiles.push({ id, file });
+      renderFileBlock({ id, file });
+
+      return false; // prevent Webix from doing anything else
+    }
+  }
+});
+
+
+// -----------------------------------------------------
+// FILE DIALOG SELECTION – ENSURE REAL FILES ONLY
+// -----------------------------------------------------
+$$("uploader").attachEvent("onBeforeFileDialog", () => {
+  // hook file dialog result
+  setTimeout(() => {
+    const sel = $$("uploader").files;  // Webix internal list
+    if(!sel) return;
+
+    Object.values(sel).forEach(item => {
+      const file = item.file;
+      if(!file) return;
+
+      if (file.size === 0) {
+    showError(`Cannot add ${file.name} (0 bytes).`);
+    return;
+}
+
+
+      const id = webix.uid().toString();
+      realFiles.push({ id, file });
+      renderFileBlock({ id, file });
+    });
+
+    $$("uploader").files.clearAll();
+  }, 50);
+});
+
+
+// -----------------------------------------------------
+// NATIVE DRAG & DROP – BLOCK EMPTY FILES
+// -----------------------------------------------------
+const dropzone = document.getElementById("dropzone");
+
+dropzone.onclick = () => {
+  $$("uploader").fileDialog();
+};
+
+dropzone.addEventListener("dragover", e => {
+  e.preventDefault();
+  dropzone.classList.add("webix_dropover");
+});
+
+dropzone.addEventListener("dragleave", () => {
+  dropzone.classList.remove("webix_dropover");
+});
+
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  dropzone.classList.remove("webix_dropover");
+
+  const items = e.dataTransfer.items;
+  if(!items) return;
+
+  for(const item of items){
+    if(item.kind === "file"){
+      const realFile = item.getAsFile();
+      if(!realFile) continue;
+
+      // HARD FILTER: BLOCK ZERO BYTE FILES
+      if (realFile.size === 0) {
+    showError(`Cannot add ${realFile.name} (0 bytes).`);
+    continue;
+}
+
+
+      const id = webix.uid().toString();
+      realFiles.push({ id, file: realFile });
+      renderFileBlock({ id, file: realFile });
+    }
+  }
+});
+
+
+// -----------------------------------------------------
+// UPLOAD TO DSA
+// -----------------------------------------------------
+document.getElementById("uploadDSABtn").onclick = function(){
+  const status = document.getElementById("statusMsg");
+
+  if(realFiles.length === 0){
+    showError("No files selected.");
+    return;
+  }
+
+  status.textContent = "⏳ Uploading to DSA...";
+  status.style.color = "#0f172a";
+
+  let done = 0, success = 0;
+
+  realFiles.forEach(({id, file})=>{
+    const form = new FormData();
+    form.append("file", file, file.name);  // ← this forces a real Blob upload
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", uploadDSAUrl, true);
+
+    xhr.upload.onprogress = e => {
+      if(e.lengthComputable){
+        const bar = document.getElementById("bar-"+id);
+        if(bar) bar.style.width = (e.loaded/e.total)*100 + "%";
+      }
+    };
+
+    xhr.onreadystatechange = () => {
+      if(xhr.readyState !== 4) return;
+
+      done++;
+      let resp=null; try{resp=JSON.parse(xhr.responseText);}catch{}
+
+      const statusSpan = document.getElementById("status-"+id);
+      const bar = document.getElementById("bar-"+id);
+
+      if(xhr.status===200 && resp && resp.status==="ok"){
+        success++;
+        lastCaseName = resp.case;
+
+        bar.style.width="100%";
+        bar.style.background="#16a34a";
+        statusSpan.textContent="Uploaded";
+        statusSpan.classList.add("status-ok");
+
+      } else {
+        bar.style.background="#dc2626";
+        statusSpan.textContent="Failed";
+        statusSpan.classList.add("status-fail");
+      }
+
+      if(done === realFiles.length){
+        if(success === done){
+          status.textContent = "✅ All files uploaded to DSA. You may now export to S3.";
+          status.style.color = "#16a34a";
+          document.getElementById("uploadS3Btn").disabled = false;
+
+        } else if(success > 0){
+          status.textContent = "⚠️ Some files uploaded, but some failed.";
+          status.style.color = "#f59e0b";
+
+        } else {
+          showError("Upload failed for all files.");
+        }
+      }
+    };
+
+    xhr.send(form);
+  });
+};
+
+
+// -----------------------------------------------------
+// EXPORT CASE TO S3
+// -----------------------------------------------------
+document.getElementById("uploadS3Btn").onclick = function(){
+  if(!lastCaseName) return;
+
+  const status = document.getElementById("statusMsg");
+  status.textContent = "⏳ Exporting to S3...";
+  status.style.color = "#0f172a";
+
+  const form = new FormData();
+  form.append("case", lastCaseName);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", uploadS3Url, true);
+
+  xhr.onreadystatechange = () => {
+    if(xhr.readyState !== 4) return;
+
+    let resp=null; try{ resp = JSON.parse(xhr.responseText);}catch{}
+
+    if(xhr.status===200 && resp && resp.status==="ok"){
+      status.textContent = "✅ Exported to S3 successfully.";
+      status.style.color = "#16a34a";
+    } else {
+      showError("S3 export failed.");
+    }
+  };
+
+  xhr.send(form);
+};
+</script>
+
+</body>
+</html>
