@@ -1,22 +1,17 @@
 # uplink/dsa_client.py
 import os
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 
 from girder_client import GirderClient
 from django.conf import settings
 
 
 def _config() -> Dict[str, str]:
-    """
-    Centralized DSA configuration from Django settings.
-    """
     api = (getattr(settings, "DSA_API_URL", "") or "").rstrip("/")
-    web = (getattr(settings, "DSA_WEB_BASE", "") or "").rstrip("/")
     coll = getattr(settings, "DSA_COLLECTION_ID", None)
     key = getattr(settings, "DSA_SERVICE_API_KEY", None)
     return {
         "api": api,
-        "web": web,
         "coll": coll,
         "key": key,
     }
@@ -24,13 +19,11 @@ def _config() -> Dict[str, str]:
 
 class DSAClient:
     """
-    Minimal DSA helper focused on:
+    DSA helper with *no* gc.post("file") and *no* presigned S3.
 
-    - Auth via API key
-    - Deriving a *case name* from the filename (ID prefix)
-    - Finding/creating a case folder under the configured collection
-    - Ensuring a "Slides" subfolder exists
-    - Uploading **real, non-zero files** using Girder's uploadFileToItem
+    - Only uses GirderClient.uploadFileToItem (stream + complete)
+    - After upload, verifies file size in DSA
+    - If size is zero or file missing, deletes the item → no placeholders
     """
 
     def __init__(self, user_token: Optional[str] = None):
@@ -47,33 +40,59 @@ class DSAClient:
         self.gc.authenticate(apiKey=token)
 
     # ------------------------------------------------------------------
-    # Case naming / grouping
+    # Case naming / grouping: RQ-23-1-SP23-960 style
     # ------------------------------------------------------------------
     @staticmethod
     def extract_case_name(filename: str) -> str:
         """
-        Extract a case name from filename using your original rule:
+        Derive the case name starting at 'RQ' and stopping before stain/format markers.
 
-        - Take base name (without path or extension)
-        - Split on first '-' and use left side as the case ID
-
-        e.g. "4439-RQ-24-24-1-S23-22919-H&E-TIFF.tiff" -> "4439"
+        Example:
+          1999-RQ-23-1-SP23-960-PDL1-TIFF.tiff
+            -> "RQ-23-1-SP23-960"
         """
         base = os.path.splitext(os.path.basename(filename))[0]
-        parts = base.split("-", 1)
-        case_name = parts[0].strip() if parts else base.strip()
-        if not case_name:
-            case_name = "Untitled"
-        return case_name
+        tokens = [t for t in base.split("-") if t]
+
+        if not tokens:
+            return "Untitled-Case"
+
+        MARKERS = {
+            "H&E", "HE",
+            "PDL1", "PD-L1",
+            "TIFF", "NDPI", "SVS",
+            "JPEG", "JPG", "PNG"
+        }
+
+        # Find first token starting with RQ
+        start_idx = None
+        for i, tok in enumerate(tokens):
+            if tok.upper().startswith("RQ"):
+                start_idx = i
+                break
+
+        if start_idx is None:
+            usable: List[str] = []
+            for tok in tokens:
+                if tok.upper() in MARKERS:
+                    break
+                usable.append(tok)
+            case_name = "-".join(usable).strip("-_ ")
+            return case_name or "Untitled-Case"
+
+        case_tokens: List[str] = []
+        for tok in tokens[start_idx:]:
+            if tok.upper() in MARKERS:
+                break
+            case_tokens.append(tok)
+
+        case_name = "-".join(case_tokens).strip("-_ ")
+        return case_name or "Untitled-Case"
 
     # ------------------------------------------------------------------
     # Case / Slides helpers
     # ------------------------------------------------------------------
     def find_case(self, case_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Find an existing case folder with the given name under the collection,
-        and ensure it has a "Slides" subfolder.
-        """
         coll = self.cfg["coll"]
         folders = self.gc.get("folder", parameters={
             "parentType": "collection",
@@ -83,7 +102,6 @@ class DSAClient:
 
         for f in folders:
             if f.get("name") == case_name:
-                # Ensure "Slides" subfolder exists
                 subs = self.gc.get("folder", parameters={
                     "parentType": "folder",
                     "parentId": f["_id"],
@@ -106,9 +124,6 @@ class DSAClient:
         return None
 
     def create_case(self, case_name: str) -> Dict[str, Any]:
-        """
-        Create a new case folder with a 'Slides' subfolder.
-        """
         case = self.gc.post("folder", data={
             "parentType": "collection",
             "parentId": self.cfg["coll"],
@@ -123,10 +138,6 @@ class DSAClient:
         return case
 
     def ensure_case_for_filename(self, filename: str) -> Dict[str, Any]:
-        """
-        Given a filename, determine its case name and return a case folder
-        (create if needed), always with a 'Slides' subfolder.
-        """
         case_name = self.extract_case_name(filename)
         print(f"DEBUG → ensure_case_for_filename: filename={filename}, case_name={case_name}")
         case = self.find_case(case_name)
@@ -138,15 +149,16 @@ class DSAClient:
         return case
 
     # ------------------------------------------------------------------
-    # Upload – Girder only, no external S3
+    # Upload – Girder only, with post-upload verification
     # ------------------------------------------------------------------
     def upload_file_to_slides(self, slides_folder_id: str, path: str, filename: str) -> str:
         """
-        Upload a REAL file (must exist and be non-zero size) into the 'Slides'
-        folder using Girder's chunked upload (uploadFileToItem).
+        Upload a REAL file into the 'Slides' folder using Girder's uploadFileToItem.
 
-        Returns:
-            item_id (str): The created item ID in DSA.
+        - Create the item
+        - Call uploadFileToItem
+        - Then verify the file in DSA has non-zero size via GET item/<id>/files
+        - If not, delete the item and raise → no placeholder left behind
         """
         if not os.path.exists(path):
             raise FileNotFoundError(f"File does not exist on disk: {path}")
@@ -165,22 +177,41 @@ class DSAClient:
         item_id = item["_id"]
         print("DEBUG → Created item:", item_id)
 
-        # 2️⃣ Upload file contents via Girder
-        self.gc.uploadFileToItem(item_id, path)
-        print("DEBUG → Girder upload complete for file:", filename)
+        try:
+            # 2️⃣ Upload contents
+            self.gc.uploadFileToItem(item_id, path)
+            print("DEBUG → Girder upload complete for file:", filename)
 
-        return item_id
+            # 3️⃣ Verify file size inside DSA using REST: GET item/<id>/files
+            files = list(self.gc.get(f"item/{item_id}/files", parameters={"limit": 0}))
+            if not files:
+                raise RuntimeError("No file objects found in DSA after upload")
+
+            # assume one file per item
+            fobj = files[0]
+            dsa_size = fobj.get("size", 0)
+            print("DEBUG → DSA file size:", dsa_size)
+
+            if not isinstance(dsa_size, int) or dsa_size <= 0:
+                raise RuntimeError(f"DSA file has invalid size after upload: {dsa_size}")
+
+            # All good
+            return item_id
+
+        except Exception as e:
+            # Cleanup to avoid orphan/placeholder items
+            print("ERROR → Upload or verification failed, deleting item:", item_id, "error:", e)
+            try:
+                self.gc.delete(f"item/{item_id}")
+            except Exception as e2:
+                print("ERROR → Failed to delete item after error:", item_id, "error:", e2)
+            # Re-raise so the view returns error to the frontend
+            raise
 
     # ------------------------------------------------------------------
     # High-level helper: upload one file and group into a case
     # ------------------------------------------------------------------
     def upload_case_file(self, path: str, filename: str) -> Tuple[str, str]:
-        """
-        - Derive case name from filename (ID prefix)
-        - Find/create that case and its 'Slides' folder
-        - Upload the file into 'Slides'
-        - Return (case_name, item_id)
-        """
         case = self.ensure_case_for_filename(filename)
         slides_folder_id = case["subfolders"]["Slides"]["_id"]
         item_id = self.upload_file_to_slides(slides_folder_id, path, filename)
