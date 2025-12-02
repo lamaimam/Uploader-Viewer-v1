@@ -12,14 +12,12 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 # ---- DEBUG BLOCK START (remove later) ----
 import os, sys
 from pathlib import Path
-print(">>> settings.py executing", file=sys.stderr)
 from dotenv import load_dotenv
 load_dotenv()  # reads variables from .env
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 dotenv_path = BASE_DIR / ".env"
 load_dotenv(dotenv_path)
-print("DEBUG → dotenv loaded from:", dotenv_path, "exists:", dotenv_path.exists())
 
 DSA_API_URL = os.getenv("DSA_API_URL", "http://localhost:8080/api/v1")
 DSA_WEB_BASE = os.getenv("DSA_WEB_BASE", "http://localhost:8080")
@@ -124,10 +122,12 @@ USE_TZ = True
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
+STATICFILES_DIRS = [
+    BASE_DIR / 'uplink/templates/static',
+]
 
 STATIC_URL = '/static/'
 
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
-
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
