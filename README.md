@@ -163,3 +163,10 @@ http://127.0.0.1:8000/<your-uploader-page>/
 Press **Ctrl + C**
 
 ---
+## **Future Work**
+
+Issues:
+1. Updating status messages to be UI friendly and synchronized with each step of the loading processes.
+2. Making load bar progress move when 'Upload Case to S3" is triggered.
+3. No placeholders in DSA unless successfully uploaded.
+4. Ensuring there are no temporary files in browser.
